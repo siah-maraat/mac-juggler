@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Package
+        run: |
+          mkdir -p release
+          cp .build/apple/Products/Release/trackpad-relay release/
+          cp Resources/com.trackpadrelay.agent.plist release/
+          cd release
+          tar -czf trackpad-relay-macos.tar.gz *
+          shasum -a 256 trackpad-relay-macos.tar.gz > trackpad-relay-macos.tar.gz.sha256
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/trackpad-relay-macos.tar.gz
+            release/trackpad-relay-macos.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
