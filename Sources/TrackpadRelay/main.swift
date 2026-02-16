@@ -6,7 +6,7 @@ struct TrackpadRelay: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "trackpad-relay",
         abstract: "WebSocket server that relays trackpad/cursor commands from iOS to macOS.",
-        version: "0.1.0"
+        version: "0.1.1"
     )
 
     @Option(name: .shortAndLong, help: "Port to listen on.")
@@ -25,34 +25,29 @@ struct TrackpadRelay: ParsableCommand {
 
         // Check accessibility permission
         if !AccessibilityCheck.ensurePermission() {
-            print("⚠️  Waiting for Accessibility permission...")
-            print("   The server will start but cursor control won't work until permission is granted.")
+            fputs("⚠️  Waiting for Accessibility permission...\n", stderr)
+            fputs("   The server will start but cursor control won't work until permission is granted.\n", stderr)
         }
 
         // Auth
         let authManager = AuthManager(token: token)
-        print("🔑 Auth token: \(authManager.currentToken)")
-        print("   Send this as the first WebSocket message:")
-        print("   {\"type\":\"auth\",\"token\":\"\(authManager.currentToken)\"}")
-        print("")
+        fputs("🔑 Auth token: \(authManager.currentToken)\n", stderr)
+        fputs("   Send this as the first WebSocket message:\n", stderr)
+        fputs("   {\"type\":\"auth\",\"token\":\"\(authManager.currentToken)\"}\n\n", stderr)
 
         // Components
         let cursorController = CursorController()
         let rateLimiter = RateLimiter(maxPerSecond: 1000)
 
-        // Bonjour
-        let bonjour = BonjourAdvertiser(port: UInt16(port))
-        bonjour.start()
-
         // Signal handling for clean shutdown
-        let signalSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
-        signal(SIGINT, SIG_IGN) // Ignore default handler
-        signalSource.setEventHandler {
-            print("\n🛑 Shutting down...")
-            bonjour.stop()
-            TrackpadRelay.exit()
-        }
-        signalSource.resume()
+        signal(SIGINT, { _ in
+            fputs("\n🛑 Shutting down...\n", stderr)
+            Darwin.exit(0)
+        })
+        signal(SIGTERM, { _ in
+            fputs("\n🛑 Shutting down...\n", stderr)
+            Darwin.exit(0)
+        })
 
         // Start WebSocket server (blocks)
         let server = WebSocketServer(

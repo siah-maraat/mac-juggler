@@ -14,7 +14,6 @@ final class WebSocketServer {
     private let rateLimiter: RateLimiter
     private let logger: Logger
     private var eventLoopGroup: EventLoopGroup?
-    private var authenticatedChannels: Set<ObjectIdentifier> = []
 
     init(
         host: String,
@@ -36,42 +35,61 @@ final class WebSocketServer {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
         self.eventLoopGroup = group
 
-        let upgrader = NIOWebSocketServerUpgrader(
-            shouldUpgrade: { channel, head in
-                channel.eventLoop.makeSucceededFuture(HTTPHeaders())
-            },
-            upgradePipelineHandler: { channel, req in
-                let wsHandler = WebSocketHandler(
-                    authManager: self.authManager,
-                    cursorController: self.cursorController,
-                    rateLimiter: self.rateLimiter,
-                    logger: self.logger,
-                    remoteAddress: channel.remoteAddress?.description ?? "unknown"
-                )
-                return channel.pipeline.addHandler(wsHandler)
-            }
-        )
+        let authManager = self.authManager
+        let cursorController = self.cursorController
+        let rateLimiter = self.rateLimiter
+        let logger = self.logger
 
-        let bootstrap = ServerBootstrap(group: group)
+        let server = try ServerBootstrap(group: group)
             .childChannelInitializer { channel in
-                let httpHandler = HTTPByteBufferResponsePartHandler()
+                let remoteAddress = channel.remoteAddress?.description ?? "unknown"
+
+                // Check local network
+                if let address = channel.remoteAddress {
+                    let ip: String?
+                    switch address {
+                    case .v4(let addr): ip = addr.host
+                    case .v6(let addr): ip = addr.host
+                    default: ip = nil
+                    }
+                    if let ip = ip, !NetworkGuard.isLocalNetwork(ip) {
+                        logger.warning("Rejected non-local connection from \(ip)")
+                        return channel.close()
+                    }
+                }
+
+                let upgrader = NIOWebSocketServerUpgrader(
+                    shouldUpgrade: { channel, head in
+                        channel.eventLoop.makeSucceededFuture(HTTPHeaders())
+                    },
+                    upgradePipelineHandler: { channel, req in
+                        let handler = RelayWebSocketHandler(
+                            authManager: authManager,
+                            cursorController: cursorController,
+                            rateLimiter: rateLimiter,
+                            logger: logger,
+                            remoteAddress: remoteAddress
+                        )
+                        return channel.pipeline.addHandler(handler)
+                    }
+                )
+
                 return channel.pipeline.configureHTTPServerPipeline(
                     withServerUpgrade: (
                         upgraders: [upgrader],
                         completionHandler: { context in }
                     )
-                ).flatMap {
-                    channel.pipeline.addHandler(httpHandler)
-                }
+                )
             }
             .serverChannelOption(ChannelOptions.backlog, value: 256)
             .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+            .bind(host: host, port: port)
+            .wait()
 
-        let channel = try bootstrap.bind(host: host, port: port).wait()
         logger.info("WebSocket server started on \(host):\(port)")
         print("🚀 Trackpad Relay listening on ws://\(host):\(port)")
 
-        try channel.closeFuture.wait()
+        try server.closeFuture.wait()
     }
 
     func stop() {
@@ -79,31 +97,8 @@ final class WebSocketServer {
     }
 }
 
-// Simple HTTP handler that responds to non-WebSocket requests
-private final class HTTPByteBufferResponsePartHandler: ChannelInboundHandler {
-    typealias InboundIn = HTTPServerRequestPart
-    typealias OutboundOut = HTTPServerResponsePart
-
-    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let part = unwrapInboundIn(data)
-        guard case .head = part else { return }
-
-        var headers = HTTPHeaders()
-        headers.add(name: "Content-Type", value: "text/plain")
-        let body = "Trackpad Relay is running. Connect via WebSocket.\n"
-
-        let head = HTTPResponseHead(version: .http1_1, status: .ok, headers: headers)
-        context.write(wrapOutboundOut(.head(head)), promise: nil)
-
-        var buffer = context.channel.allocator.buffer(capacity: body.utf8.count)
-        buffer.writeString(body)
-        context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
-    }
-}
-
 // WebSocket frame handler
-private final class WebSocketHandler: ChannelInboundHandler {
+private final class RelayWebSocketHandler: ChannelInboundHandler {
     typealias InboundIn = WebSocketFrame
     typealias OutboundOut = WebSocketFrame
 
@@ -130,22 +125,17 @@ private final class WebSocketHandler: ChannelInboundHandler {
         self.remoteAddress = remoteAddress
     }
 
-    func channelActive(context: ChannelHandlerContext) {
-        // Check if connection is from local network
-        if let address = context.channel.remoteAddress,
-           let ip = extractIP(from: address) {
-            if !NetworkGuard.isLocalNetwork(ip) {
-                logger.warning("Rejected non-local connection from \(ip)")
-                context.close(promise: nil)
-                return
-            }
-        }
-
+    func handlerAdded(context: ChannelHandlerContext) {
         logger.info("Client connected from \(remoteAddress)")
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let frame = unwrapInboundIn(data)
+        var frame = unwrapInboundIn(data)
+
+        // Client frames are masked per RFC 6455 — unmask before reading
+        if let maskKey = frame.maskKey {
+            frame.data.webSocketUnmask(maskKey)
+        }
 
         switch frame.opcode {
         case .text:
@@ -196,7 +186,7 @@ private final class WebSocketHandler: ChannelInboundHandler {
         // Rate limit
         if !rateLimiter.allow() {
             logger.warning("Rate limit exceeded for \(remoteAddress)")
-            return // silently drop
+            return
         }
 
         // Dispatch cursor commands
@@ -222,17 +212,6 @@ private final class WebSocketHandler: ChannelInboundHandler {
         buffer.writeString(text)
         let frame = WebSocketFrame(fin: true, opcode: .text, data: buffer)
         context.writeAndFlush(wrapOutboundOut(frame), promise: nil)
-    }
-
-    private func extractIP(from address: SocketAddress) -> String? {
-        switch address {
-        case .v4(let addr):
-            return addr.host
-        case .v6(let addr):
-            return addr.host
-        default:
-            return nil
-        }
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
